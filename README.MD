@@ -15,7 +15,7 @@ TORE converts asynchronous event streams into dense, time-ordered volume represe
 ## Installation
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/StarkLuo/TORE_CUDA.git
 cd tore_cuda
 pip install .
 ```
