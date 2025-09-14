@@ -198,8 +198,8 @@ at::Tensor build_tore_volume_single_cuda(
     int tq    = t_query_opt.has_value() ? (int)(*t_query_opt) : max_t;
     if (tq < 0) tq = max_t;
 
-    // 过滤 t <= tq
-    auto keep = (t <= tq);
+    // 过滤：t <= tq 且 坐标在 [0,H)×[0,W)
+    auto keep = (t <= tq) & x.ge(0) & x.lt((int)W) & y.ge(0) & y.lt((int)H);
     auto xs = x.masked_select(keep);
     auto ys = y.masked_select(keep);
     auto ts = t.masked_select(keep);
