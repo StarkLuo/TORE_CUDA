@@ -473,34 +473,3 @@ tore = tore_cuda.tore_build_single_resized(events, 240, 320, 480, 640, ...)
 tore = tore_cuda.tore_build_single_resized(events, 480, 640, 240, 320, ...)
 ```
 
-## 版本信息
-
-```python
-print(tore_cuda.tore_version())  # "0.0.2"
-print(tore_cuda.__version__)     # "0.0.2"
-```
-
-## 注意事项
-
-1. **事件数据格式**: 必须是CUDA tensor，形状[N,4]，列顺序为(x,y,t,p)
-2. **坐标范围**: x∈[0,W), y∈[0,H), t≥0, p∈{-1,+1}
-3. **resize限制**: 只允许向下resize（目标尺寸 ≤ 原始尺寸）
-4. **内存要求**: 大批量处理时需要足够的GPU内存
-5. **数据类型**: 支持float32、bfloat16、float16
-
-## 性能优化建议
-
-1. **批处理**: 尽量使用批量接口而非循环调用单样本
-2. **数据类型**: 根据模型需求选择合适的数据类型（bfloat16/float16可节省内存）
-3. **事件过滤**: 在输入前过滤掉明显异常的事件数据
-4. **内存管理**: 大batch size时考虑分批次处理
-
-## 更新日志
-
-### v0.0.2 (当前版本)
-- 新增事件resize功能（按比例和正方形）
-- 保持完全向后兼容
-- 优化内存使用
-
-### v0.0.1
-- 初始版本，基础TORE功能
