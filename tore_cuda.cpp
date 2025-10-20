@@ -569,6 +569,189 @@ at::Tensor tore_build_batch_stacked_square_crop(
     return out;
 }
 
+// Python 端 API：带时间窗口滑动的批量堆叠处理（v0.0.4新增）
+at::Tensor tore_build_batch_stacked_windowed(
+    const std::vector<at::Tensor>& events_list,
+    int64_t H, int64_t W, int64_t K,
+    double window_length,  // 窗口长度（毫秒）
+    double stride,         // 滑动步长（毫秒）
+    double t0, double tmax,
+    const std::string& resize_mode,  // "none", "resize", "square", "square_crop"
+    c10::optional<std::vector<int64_t>> orig_H_list,
+    c10::optional<std::vector<int64_t>> orig_W_list,
+    c10::optional<int64_t> target_H,
+    c10::optional<int64_t> target_W,
+    c10::optional<int64_t> target_size,
+    double tail_threshold,  // 尾部合并阈值（默认0.5）
+    bool out_chw,
+    c10::optional<at::ScalarType> dtype_opt
+) {
+    TORCH_CHECK(!events_list.empty(), "events_list is empty");
+    
+    auto dev = events_list[0].device();
+    for (auto& ev : events_list) {
+        TORCH_CHECK(ev.is_cuda(), "all events must be CUDA tensors");
+        TORCH_CHECK(ev.device() == dev, "all events must be on the same device");
+        TORCH_CHECK(ev.dim() == 2 && ev.size(1) == 4, "each events must be [N,4]");
+    }
+    c10::cuda::CUDAGuard guard(dev);
+    auto out_dtype = dtype_opt.has_value() ? *dtype_opt : at::kFloat;
+    
+    // 参数验证
+    if (resize_mode == "resize") {
+        TORCH_CHECK(target_H.has_value() && target_W.has_value(), 
+                    "resize mode requires target_H and target_W");
+        TORCH_CHECK(orig_H_list.has_value() && orig_W_list.has_value(),
+                    "resize mode requires orig_H_list and orig_W_list");
+    } else if (resize_mode == "square" || resize_mode == "square_crop") {
+        TORCH_CHECK(target_size.has_value(), 
+                    "square mode requires target_size");
+        TORCH_CHECK(orig_H_list.has_value() && orig_W_list.has_value(),
+                    "square mode requires orig_H_list and orig_W_list");
+    } else if (resize_mode != "none") {
+        TORCH_CHECK(false, "resize_mode must be one of: none, resize, square, square_crop");
+    }
+    
+    // 时间单位转换：毫秒 → 微秒
+    double window_length_us = window_length * 1000.0;
+    double stride_us = stride * 1000.0;
+    
+    const int64_t B = (int64_t)events_list.size();
+    
+    // 第一步：计算每个样本的views
+    std::vector<std::vector<at::Tensor>> all_views;
+    all_views.reserve(B);
+    
+    for (int64_t i = 0; i < B; ++i) {
+        const at::Tensor& events = events_list[i];
+        
+        if (events.size(0) == 0) {
+            // 空样本，创建一个空view
+            all_views.push_back({});
+            continue;
+        }
+        
+        // 获取时间列
+        auto times = events.select(1, 2);
+        auto times_cpu = times.cpu();
+        auto times_acc = times_cpu.accessor<float, 1>();
+        
+        // 找时间范围
+        float min_t = times.min().item<float>();
+        float max_t = times.max().item<float>();
+        
+        std::vector<at::Tensor> views;
+        float t_start = min_t;
+        
+        while (t_start < max_t) {
+            float t_end = t_start + window_length_us;
+            float actual_t_end = std::min(t_end, max_t);
+            
+            // 提取时间在[t_start, t_end)范围内的事件
+            auto mask = (times >= t_start) & (times < actual_t_end);
+            auto indices = mask.nonzero().squeeze(1);
+            
+            if (indices.numel() == 0) {
+                // 窗口内无事件，跳过或创建空TORE？这里选择跳过
+                t_start += stride_us;
+                continue;
+            }
+            
+            auto window_events = events.index_select(0, indices);
+            
+            // 根据resize_mode处理事件
+            at::Tensor processed_events;
+            int64_t out_H, out_W;
+            
+            if (resize_mode == "none") {
+                processed_events = window_events;
+                out_H = H;
+                out_W = W;
+            } else if (resize_mode == "resize") {
+                processed_events = resize_events(window_events, 
+                    (*orig_H_list)[i], (*orig_W_list)[i], *target_H, *target_W);
+                out_H = *target_H;
+                out_W = *target_W;
+            } else if (resize_mode == "square") {
+                processed_events = resize_events_square(window_events,
+                    (*orig_H_list)[i], (*orig_W_list)[i], *target_size);
+                out_H = *target_size;
+                out_W = *target_size;
+            } else {  // square_crop
+                processed_events = resize_events_square_crop(window_events,
+                    (*orig_H_list)[i], (*orig_W_list)[i], *target_size);
+                out_H = *target_size;
+                out_W = *target_size;
+            }
+            
+            // 构建TORE，使用窗口结束时间作为t_query
+            int64_t t_query = static_cast<int64_t>(actual_t_end);
+            at::Tensor tore_view = build_tore_volume_single_cuda(
+                processed_events, out_H, out_W, K, t0, tmax, 
+                t_query, out_chw, out_dtype
+            );
+            
+            views.push_back(tore_view);
+            
+            // 检查下一个窗口
+            float next_start = t_start + stride_us;
+            if (next_start >= max_t) {
+                break;
+            }
+            
+            // 检查是否会产生过短的尾部
+            float remaining = max_t - next_start;
+            if (remaining < stride_us * tail_threshold) {
+                // 尾部太短，不再创建新view
+                break;
+            }
+            
+            t_start = next_start;
+        }
+        
+        all_views.push_back(views);
+    }
+    
+    // 第二步：对齐views数量（截断到最小值）
+    int64_t min_views = INT64_MAX;
+    for (const auto& views : all_views) {
+        if (!views.empty()) {
+            min_views = std::min(min_views, (int64_t)views.size());
+        }
+    }
+    
+    TORCH_CHECK(min_views > 0 && min_views != INT64_MAX, 
+                "All samples have zero views, check your window parameters");
+    
+    // 第三步：堆叠为 [B, Views, ...]
+    // 先确定单个TORE的形状
+    int64_t out_H = H, out_W = W;
+    if (resize_mode == "resize") {
+        out_H = *target_H;
+        out_W = *target_W;
+    } else if (resize_mode == "square" || resize_mode == "square_crop") {
+        out_H = *target_size;
+        out_W = *target_size;
+    }
+    
+    at::Tensor out;
+    auto opts = at::TensorOptions().dtype(out_dtype).device(dev);
+    if (out_chw) {
+        out = at::empty({B, min_views, 2*K, out_H, out_W}, opts);
+    } else {
+        out = at::empty({B, min_views, 2, K, out_H, out_W}, opts);
+    }
+    
+    // 复制数据
+    for (int64_t i = 0; i < B; ++i) {
+        for (int64_t v = 0; v < min_views; ++v) {
+            out.select(0, i).select(0, v).copy_(all_views[i][v]);
+        }
+    }
+    
+    return out;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("tore_build_single", &tore_build_single,
           "Build TORE for a single sample on CUDA");
@@ -594,6 +777,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Build TORE for a batch with square resize on CUDA (returns stacked tensor)");
     m.def("tore_build_batch_stacked_square_crop", &tore_build_batch_stacked_square_crop,
           "Build TORE for a batch with square resize (crop mode) on CUDA (returns stacked tensor)");
-    m.def("tore_version", [](){ return std::string("0.0.3"); }, "Return tore_cuda version");
-    m.attr("__version__") = "0.0.3";
+    m.def("tore_build_batch_stacked_windowed", &tore_build_batch_stacked_windowed,
+          "Build TORE for a batch with temporal sliding windows on CUDA (returns stacked tensor with views dimension)");
+    m.def("tore_version", [](){ return std::string("0.0.4"); }, "Return tore_cuda version");
+    m.attr("__version__") = "0.0.4";
 }

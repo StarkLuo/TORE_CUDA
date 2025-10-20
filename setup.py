@@ -24,8 +24,8 @@ except Exception as e:
 
 setup(
     name='tore_cuda',
-    version='0.0.2',
-    description='TORE CUDA kernels with resize support',
+    version='0.0.4',
+    description='TORE CUDA kernels with resize and temporal sliding window support',
     ext_modules=ext_modules,
     cmdclass=cmdclass,
 )
